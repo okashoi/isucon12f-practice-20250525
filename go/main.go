@@ -1110,13 +1110,11 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			ids := make([]int64, len(updateItems))
 			caseWhenAmount := make([]string, len(updateItems))
 			caseWhenUpdated := make([]string, len(updateItems))
-			updateArgs := make([]interface{}, 0, len(updateItems)*4)
 
 			for i, item := range updateItems {
 				ids[i] = item.ID
-				caseWhenAmount[i] = "WHEN ? THEN ?"
-				caseWhenUpdated[i] = "WHEN ? THEN ?"
-				updateArgs = append(updateArgs, item.ID, item.Amount, item.ID, item.UpdatedAt)
+				caseWhenAmount[i] = fmt.Sprintf("WHEN %d THEN %d", item.ID, item.Amount)
+				caseWhenUpdated[i] = fmt.Sprintf("WHEN %d THEN %d", item.ID, item.UpdatedAt)
 			}
 
 			// sqlx.Inを使って安全にIN句を構築
@@ -1132,8 +1130,7 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			for i, id := range ids {
 				idsInterface[i] = id
 			}
-			allArgs := append(updateArgs, idsInterface...)
-			query, params, err := sqlx.In(baseQuery, allArgs...)
+			query, params, err := sqlx.In(baseQuery, idsInterface)
 			if err != nil {
 				return err
 			}
