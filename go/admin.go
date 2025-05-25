@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -215,11 +216,27 @@ type AdminListMasterResponse struct {
 // adminUpdateMaster マスタデータ更新
 // PUT /admin/master
 func (h *Handler) adminUpdateMaster(c echo.Context) error {
+	// Start transaction on the main DB
 	tx, err := h.DB.Beginx()
 	if err != nil {
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
 	defer tx.Rollback() //nolint:errcheck
+
+	// Start transactions on all sharded DBs
+	txs := make([]*sqlx.Tx, 0, len(h.DBs))
+	for _, db := range h.DBs {
+		shardTx, err := db.Beginx()
+		if err != nil {
+			// Rollback all previously started transactions
+			for _, t := range txs {
+				t.Rollback() //nolint:errcheck
+			}
+			return errorResponse(c, http.StatusInternalServerError, err)
+		}
+		txs = append(txs, shardTx)
+		defer shardTx.Rollback() //nolint:errcheck
+	}
 
 	// version master
 	versionMasterRecs, err := readFormFileToCSV(c, "versionMaster")
@@ -244,6 +261,13 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 		query := "INSERT INTO version_masters(id, status, master_version) VALUES (:id, :status, :master_version) ON DUPLICATE KEY UPDATE status=VALUES(status), master_version=VALUES(master_version)"
 		if _, err = tx.NamedExec(query, data); err != nil {
 			return errorResponse(c, http.StatusInternalServerError, err)
+		}
+
+		// Execute the same query on all shard DBs
+		for _, shardTx := range txs {
+			if _, err = shardTx.NamedExec(query, data); err != nil {
+				return errorResponse(c, http.StatusInternalServerError, err)
+			}
 		}
 	} else {
 		c.Logger().Debug("Skip Update Master: versionMaster")
@@ -283,6 +307,13 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 		}, " ")
 		if _, err = tx.NamedExec(query, data); err != nil {
 			return errorResponse(c, http.StatusInternalServerError, err)
+		}
+
+		// Execute the same query on all shard DBs
+		for _, shardTx := range txs {
+			if _, err = shardTx.NamedExec(query, data); err != nil {
+				return errorResponse(c, http.StatusInternalServerError, err)
+			}
 		}
 	} else {
 		c.Logger().Debug("Skip Update Master: itemMaster")
@@ -355,6 +386,13 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 		if _, err = tx.NamedExec(query, data); err != nil {
 			return errorResponse(c, http.StatusInternalServerError, err)
 		}
+
+		// Execute the same query on all shard DBs
+		for _, shardTx := range txs {
+			if _, err = shardTx.NamedExec(query, data); err != nil {
+				return errorResponse(c, http.StatusInternalServerError, err)
+			}
+		}
 	} else {
 		c.Logger().Debug("Skip Update Master: gachaItemMaster")
 	}
@@ -391,6 +429,13 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 		}, " ")
 		if _, err = tx.NamedExec(query, data); err != nil {
 			return errorResponse(c, http.StatusInternalServerError, err)
+		}
+
+		// Execute the same query on all shard DBs
+		for _, shardTx := range txs {
+			if _, err = shardTx.NamedExec(query, data); err != nil {
+				return errorResponse(c, http.StatusInternalServerError, err)
+			}
 		}
 	} else {
 		c.Logger().Debug("Skip Update Master: presentAllMaster")
@@ -430,6 +475,13 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 		}, " ")
 		if _, err = tx.NamedExec(query, data); err != nil {
 			return errorResponse(c, http.StatusInternalServerError, err)
+		}
+
+		// Execute the same query on all shard DBs
+		for _, shardTx := range txs {
+			if _, err = shardTx.NamedExec(query, data); err != nil {
+				return errorResponse(c, http.StatusInternalServerError, err)
+			}
 		}
 	} else {
 		c.Logger().Debug("Skip Update Master: loginBonusMaster")
@@ -476,9 +528,17 @@ func (h *Handler) adminUpdateMaster(c echo.Context) error {
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
 
+	// Commit the main DB transaction
 	err = tx.Commit()
 	if err != nil {
 		return errorResponse(c, http.StatusInternalServerError, err)
+	}
+
+	// Commit all shard DB transactions
+	for _, shardTx := range txs {
+		if err = shardTx.Commit(); err != nil {
+			return errorResponse(c, http.StatusInternalServerError, err)
+		}
 	}
 
 	return successResponse(c, &AdminUpdateMasterResponse{
