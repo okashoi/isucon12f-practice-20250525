@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/snowflake"
-	"github.com/go-sql-driver/mysql"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v4"
