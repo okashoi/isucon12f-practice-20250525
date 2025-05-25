@@ -12,7 +12,7 @@ stop-services:
 build:
 	cd go && go build -o isuconquest
 
-logs: limit=10000
+logs: limit=100000
 logs: opts=
 logs:
 	journalctl -ex --since "$(shell systemctl status isuconquest.go.service | grep "Active:" | awk '{print $$6, $$7}')" -n $(limit) -q $(opts)
