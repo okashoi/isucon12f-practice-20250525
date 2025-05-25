@@ -641,6 +641,7 @@ type AdminBanUserResponse struct {
 }
 
 // hashPassword パスワードをハッシュ化する
+//
 //nolint:deadcode,unused
 func hashPassword(pw string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)

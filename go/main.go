@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/bwmarrin/snowflake"
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -49,9 +50,20 @@ type Handler struct {
 	DB *sqlx.DB
 }
 
+var (
+	snowflakeNode *snowflake.Node
+)
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	time.Local = time.FixedZone("Local", 9*60*60)
+
+	node, err := snowflake.NewNode(1)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	snowflakeNode = node
 
 	e := echo.New()
 	e.Use(middleware.Logger())
@@ -1853,25 +1865,9 @@ func noContentResponse(c echo.Context, status int) error {
 
 // generateID ユニークなIDを生成する
 func (h *Handler) generateID() (int64, error) {
-	var updateErr error
-	for i := 0; i < 100; i++ {
-		res, err := h.DB.Exec("UPDATE id_generator SET id=LAST_INSERT_ID(id+1)")
-		if err != nil {
-			if merr, ok := err.(*mysql.MySQLError); ok && merr.Number == 1213 {
-				updateErr = err
-				continue
-			}
-			return 0, err
-		}
+	id := snowflakeNode.Generate()
 
-		id, err := res.LastInsertId()
-		if err != nil {
-			return 0, err
-		}
-		return id, nil
-	}
-
-	return 0, fmt.Errorf("failed to generate id: %w", updateErr)
+	return id.Int64(), nil
 }
 
 // generateUUID UUIDの生成
