@@ -1104,36 +1104,35 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			}
 		}
 
-		// 一括UPDATE（真のバルク処理）
+		// 一括UPDATE（CASE文使用、sqlx.Inで安全に構築）
 		if len(updateItems) > 0 {
-			// CASE文を使った一括UPDATE
+			// IDリストを作成
+			ids := make([]int64, len(updateItems))
 			caseWhenAmount := make([]string, len(updateItems))
 			caseWhenUpdated := make([]string, len(updateItems))
 			updateArgs := make([]interface{}, 0, len(updateItems)*4)
-			updateIDs := make([]interface{}, 0, len(updateItems))
 
 			for i, item := range updateItems {
+				ids[i] = item.ID
 				caseWhenAmount[i] = "WHEN ? THEN ?"
 				caseWhenUpdated[i] = "WHEN ? THEN ?"
 				updateArgs = append(updateArgs, item.ID, item.Amount, item.ID, item.UpdatedAt)
-				updateIDs = append(updateIDs, item.ID)
 			}
 
-			placeholders := strings.Repeat("?,", len(updateItems))
-			if len(placeholders) > 0 {
-				placeholders = placeholders[:len(placeholders)-1] // 最後のカンマを削除
-			}
-
-			query := fmt.Sprintf(`UPDATE user_items SET
+			// sqlx.Inを使って安全にIN句を構築
+			baseQuery := fmt.Sprintf(`UPDATE user_items SET
 				amount = CASE id %s END,
 				updated_at = CASE id %s END
-				WHERE id IN (%s)`,
+				WHERE id IN (?)`,
 				strings.Join(caseWhenAmount, " "),
-				strings.Join(caseWhenUpdated, " "),
-				placeholders)
+				strings.Join(caseWhenUpdated, " "))
 
-			allArgs := append(updateArgs, updateIDs...)
-			if _, err := tx.Exec(query, allArgs...); err != nil {
+			query, params, err := sqlx.In(baseQuery, updateArgs, ids)
+			if err != nil {
+				return err
+			}
+
+			if _, err := tx.Exec(query, params...); err != nil {
 				return err
 			}
 		}
