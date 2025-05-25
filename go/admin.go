@@ -667,7 +667,7 @@ func (h *Handler) adminBanUser(c echo.Context) error {
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
 	query = "INSERT user_bans(id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE updated_at = ?"
-	if _, err = h.DB.Exec(query, banID, userID, requestAt, requestAt, requestAt); err != nil {
+	if _, err = h.getDBForUserID(userID).Exec(query, banID, userID, requestAt, requestAt, requestAt); err != nil {
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
 
