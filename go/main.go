@@ -1127,7 +1127,13 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 				strings.Join(caseWhenAmount, " "),
 				strings.Join(caseWhenUpdated, " "))
 
-			query, params, err := sqlx.In(baseQuery, updateArgs, ids)
+			// updateArgsとidsを結合（型変換が必要）
+			idsInterface := make([]interface{}, len(ids))
+			for i, id := range ids {
+				idsInterface[i] = id
+			}
+			allArgs := append(updateArgs, idsInterface...)
+			query, params, err := sqlx.In(baseQuery, allArgs...)
 			if err != nil {
 				return err
 			}
