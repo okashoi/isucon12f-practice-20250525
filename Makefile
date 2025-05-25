@@ -18,7 +18,7 @@ logs:
 	journalctl -ex --since "$(shell systemctl status isuconquest.go.service | grep "Active:" | awk '{print $$6, $$7}')" -n $(limit) -q $(opts)
 
 logs/error:
-	$(MAKE) logs opts='--grep "(error|panic|- 500)" --no-pager'
+	$(MAKE) logs opts='--grep "status=500" --no-pager'
 
 logs/clear:
 	sudo journalctl --vacuum-size=1K
