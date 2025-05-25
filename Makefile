@@ -37,7 +37,7 @@ start-services:
 	sudo systemctl start nginx
 
 bench:
-	ssh isucon-bench "./bin/benchmarker -target-host 172.31.34.129 --request-timeout=30s"
+	ssh isucon-bench "./bin/benchmarker -target-host 172.31.34.129 --request-timeout=10s"
 
 kataribe: timestamp=$(shell TZ=Asia/Tokyo date "+%Y%m%d-%H%M%S")
 kataribe:
