@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -37,6 +38,8 @@ var (
 	ErrUnauthorized             error = fmt.Errorf("unauthorized user")
 	ErrForbidden                error = fmt.Errorf("forbidden")
 	ErrGeneratePassword         error = fmt.Errorf("failed to password hash") //nolint:deadcode
+
+	dbHosts []string = strings.Split(getEnv("ISUCON_DB_HOSTS", "127.0.0.1"), ",")
 )
 
 const (
@@ -92,6 +95,7 @@ func main() {
 
 	// utility
 	e.POST("/initialize", initialize)
+	e.POST("/initializeOne", initializeOne)
 	e.GET("/health", h.health)
 
 	// feature
@@ -289,47 +293,19 @@ func (h *Handler) checkSessionMiddleware(next echo.HandlerFunc) echo.HandlerFunc
 }
 
 // checkOneTimeToken ワンタイムトークンの確認用middleware
-func (h *Handler) checkOneTimeToken(token string, tokenType int, requestAt int64) error {
+func (h *Handler) checkOneTimeToken(userID int64, token string, tokenType int, requestAt int64) error {
 	// トークンを全てのDBから検索
-	var tk *UserOneTimeToken
 	var db *sqlx.DB
-
-	if len(h.DBs) == 0 {
-		// DBが1つしかない場合
-		tk = new(UserOneTimeToken)
-		query := "SELECT * FROM user_one_time_tokens WHERE token=? AND token_type=? AND deleted_at IS NULL"
-		if err := h.DB.Get(tk, query, token, tokenType); err != nil {
-			if err == sql.ErrNoRows {
-				return ErrInvalidToken
-			}
-			return err
-		}
-		db = h.DB
-	} else {
-		// 複数DBがある場合、全てのDBから検索
-		for _, dbx := range h.DBs {
-			tmpTk := new(UserOneTimeToken)
-			query := "SELECT * FROM user_one_time_tokens WHERE token=? AND token_type=? AND deleted_at IS NULL"
-			if err := dbx.Get(tmpTk, query, token, tokenType); err != nil {
-				if err == sql.ErrNoRows {
-					continue
-				}
-				return err
-			}
-			// トークンが見つかった
-			tk = tmpTk
-			db = dbx
-			break
-		}
-
-		if tk == nil {
-			// 全てのDBで見つからなかった
-			return ErrInvalidToken
-		}
-	}
-
+	tk := new(UserOneTimeToken)
 	// ユーザーIDに基づいて適切なDBを選択
 	db = h.getDBForUserID(tk.UserID)
+	query := "SELECT * FROM user_one_time_tokens WHERE token=? AND token_type=? AND deleted_at IS NULL"
+	if err := db.Get(tk, query, token, tokenType); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrInvalidToken
+		}
+		return err
+	}
 
 	if tk.ExpiredAt < requestAt {
 		query := "UPDATE user_one_time_tokens SET deleted_at=? WHERE token=?"
@@ -340,7 +316,7 @@ func (h *Handler) checkOneTimeToken(token string, tokenType int, requestAt int64
 	}
 
 	// 使ったトークンは失効する
-	query := "UPDATE user_one_time_tokens SET deleted_at=? WHERE token=?"
+	query = "UPDATE user_one_time_tokens SET deleted_at=? WHERE token=?"
 	if _, err := db.Exec(query, requestAt, token); err != nil {
 		return err
 	}
@@ -712,6 +688,40 @@ func initialize(c echo.Context) error {
 	}
 	defer dbx.Close()
 
+	errCh := make(chan error, len(dbHosts))
+	wg := sync.WaitGroup{}
+
+	defer close(errCh)
+
+	for _, host := range dbHosts {
+		wg.Add(1)
+		go func(host string) {
+			defer wg.Done()
+
+			resp, err := http.Post(fmt.Sprintf("http://%s:8080/initializeOne", host), "application/json", nil)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				errCh <- fmt.Errorf("CODE: %d", resp.StatusCode)
+				return
+			}
+		}(host)
+	}
+
+	wg.Wait()
+	if len(errCh) > 0 {
+		return errorResponse(c, http.StatusInternalServerError, <-errCh)
+	}
+
+	return successResponse(c, &InitializeResponse{
+		Language: "go",
+	})
+}
+
+func initializeOne(c echo.Context) error {
 	out, err := exec.Command("/bin/sh", "-c", SQLDirectory+"init.sh").CombinedOutput()
 	if err != nil {
 		c.Logger().Errorf("Failed to initialize %s: %v", string(out), err)
@@ -1151,7 +1161,7 @@ func (h *Handler) drawGacha(c echo.Context) error {
 		return errorResponse(c, http.StatusInternalServerError, ErrGetRequestTime)
 	}
 
-	if err = h.checkOneTimeToken(req.OneTimeToken, 1, requestAt); err != nil {
+	if err = h.checkOneTimeToken(userID, req.OneTimeToken, 1, requestAt); err != nil {
 		if err == ErrInvalidToken {
 			return errorResponse(c, http.StatusBadRequest, err)
 		}
@@ -1538,7 +1548,7 @@ func (h *Handler) addExpToCard(c echo.Context) error {
 		return errorResponse(c, http.StatusInternalServerError, ErrGetRequestTime)
 	}
 
-	if err = h.checkOneTimeToken(req.OneTimeToken, 2, requestAt); err != nil {
+	if err = h.checkOneTimeToken(userID, req.OneTimeToken, 2, requestAt); err != nil {
 		if err == ErrInvalidToken {
 			return errorResponse(c, http.StatusBadRequest, err)
 		}
