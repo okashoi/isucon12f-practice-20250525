@@ -1956,8 +1956,8 @@ func (h *Handler) receivePresent(c echo.Context) error {
 	db := h.getDBForUserID(userID)
 
 	// 未取得のプレゼント取得
-	query := "SELECT * FROM user_presents WHERE id IN (?) AND deleted_at IS NULL"
-	query, params, err := sqlx.In(query, req.PresentIDs)
+	query := "SELECT * FROM user_presents WHERE user_id = ? AND id IN (?) AND deleted_at IS NULL"
+	query, params, err := sqlx.In(query, userID, req.PresentIDs)
 	if err != nil {
 		return errorResponse(c, http.StatusBadRequest, err)
 	}
@@ -1990,8 +1990,8 @@ func (h *Handler) receivePresent(c echo.Context) error {
 	}
 
 	// プレゼントを一括で削除済みにマーク
-	query = "UPDATE user_presents SET deleted_at=?, updated_at=? WHERE id IN (?)"
-	query, params, err = sqlx.In(query, requestAt, requestAt, presentIDs)
+	query = "UPDATE user_presents SET deleted_at=?, updated_at=? WHERE user_id = ? AND id IN (?)"
+	query, params, err = sqlx.In(query, requestAt, requestAt, userID, presentIDs)
 	if err != nil {
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
