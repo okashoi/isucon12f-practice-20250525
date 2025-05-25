@@ -10,20 +10,19 @@ stop-services:
 	ssh isucon-s3 "sudo systemctl stop $(APPNAME)"
 	sudo systemctl stop mysql
 	ssh isucon-s2 "sudo systemctl stop mysql"
-	ssh isucon-s3 "sudo systemctl stop mysql"
 
 build:
 	cd go && go build -o isuconquest
 	scp isuconquest isucon-s2:~/webapp/go/isuconquest
 	scp isuconquest isucon-s3:~/webapp/go/isuconquest
 
-logs: limit=10000
+logs: limit=100000
 logs: opts=
 logs:
 	journalctl -ex --since "$(shell systemctl status isuconquest.go.service | grep "Active:" | awk '{print $$6, $$7}')" -n $(limit) -q $(opts)
 
 logs/error:
-	$(MAKE) logs opts='--grep "(error|panic|- 500)" --no-pager'
+	$(MAKE) logs opts='--grep "status=500" --no-pager'
 
 logs/clear:
 	sudo journalctl --vacuum-size=1K
@@ -40,14 +39,14 @@ start-services:
 	sudo systemctl daemon-reload
 	ssh isucon-s2 "sudo systemctl start mysql"
 	ssh isucon-s3 "sudo systemctl start mysql"
-	sudo systemctl start mysql
+	ssh isucon-s3 "sudo systemctl start mysql"
 	sudo systemctl start $(APPNAME)
 	ssh isucon-s2 "sudo systemctl start $(APPNAME)"
 	ssh isucon-s3 "sudo systemctl start $(APPNAME)"
 	sudo systemctl start nginx
 
 bench:
-	ssh isucon-bench "./bin/benchmarker -target-host 172.31.34.129 --request-timeout=30s"
+	ssh isucon-bench "./bin/benchmarker --stage=prod -target-host=172.31.34.129 --request-timeout=10s"
 
 kataribe: timestamp=$(shell TZ=Asia/Tokyo date "+%Y%m%d-%H%M%S")
 kataribe:
