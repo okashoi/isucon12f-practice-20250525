@@ -15,7 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/bwmarrin/snowflake"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v4"
@@ -54,9 +55,20 @@ type Handler struct {
 	DBs []*sqlx.DB
 }
 
+var (
+	snowflakeNode *snowflake.Node
+)
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	time.Local = time.FixedZone("Local", 9*60*60)
+
+	node, err := snowflake.NewNode(1)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	snowflakeNode = node
 
 	e := echo.New()
 	e.Use(middleware.Logger())
@@ -130,7 +142,7 @@ func main() {
 // connectDB DBに接続する
 func connectDB(batch bool) (*sqlx.DB, error) {
 	dsn := fmt.Sprintf(
-		"%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=%s&multiStatements=%t",
+		"%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=%s&multiStatements=%t&interpolateParams=true",
 		getEnv("ISUCON_DB_USER", "isucon"),
 		getEnv("ISUCON_DB_PASSWORD", "isucon"),
 		getEnv("ISUCON_DB_HOST", "127.0.0.1"),
@@ -422,18 +434,43 @@ func (h *Handler) obtainLoginBonus(tx *sqlx.Tx, userID int64, requestAt int64) (
 		return nil, err
 	}
 
+	if len(loginBonuses) == 0 {
+		return make([]*UserLoginBonus, 0), nil
+	}
+
+	// ログインボーナスIDを一括取得
+	bonusIDs := make([]int64, len(loginBonuses))
+	for i, bonus := range loginBonuses {
+		bonusIDs[i] = bonus.ID
+	}
+
+	// 既存のユーザーログインボーナスを一括取得
+	query = "SELECT * FROM user_login_bonuses WHERE user_id=? AND login_bonus_id IN (?)"
+	query, params, err := sqlx.In(query, userID, bonusIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	existingBonuses := make([]*UserLoginBonus, 0)
+	if err := tx.Select(&existingBonuses, query, params...); err != nil {
+		return nil, err
+	}
+
+	// 既存ボーナスをマップ化
+	existingMap := make(map[int64]*UserLoginBonus)
+	for _, bonus := range existingBonuses {
+		existingMap[bonus.LoginBonusID] = bonus
+	}
+
 	sendLoginBonuses := make([]*UserLoginBonus, 0)
+	rewardItems := make([]*LoginBonusRewardMaster, 0)
 
+	// 各ログインボーナスを処理
 	for _, bonus := range loginBonuses {
-		initBonus := false
-		userBonus := new(UserLoginBonus)
-		query = "SELECT * FROM user_login_bonuses WHERE user_id=? AND login_bonus_id=?"
-		if err := tx.Get(userBonus, query, userID, bonus.ID); err != nil {
-			if err != sql.ErrNoRows {
-				return nil, err
-			}
-			initBonus = true
+		userBonus, exists := existingMap[bonus.ID]
+		initBonus := !exists
 
+		if !exists {
 			ubID, err := h.generateID()
 			if err != nil {
 				return nil, err
@@ -463,20 +500,11 @@ func (h *Handler) obtainLoginBonus(tx *sqlx.Tx, userID int64, requestAt int64) (
 		}
 		userBonus.UpdatedAt = requestAt
 
-		// 付与するリソース取得
-		rewardItem := new(LoginBonusRewardMaster)
-		query = "SELECT * FROM login_bonus_reward_masters WHERE login_bonus_id=? AND reward_sequence=?"
-		if err := tx.Get(rewardItem, query, bonus.ID, userBonus.LastRewardSequence); err != nil {
-			if err == sql.ErrNoRows {
-				return nil, ErrLoginBonusRewardNotFound
-			}
-			return nil, err
-		}
-
-		_, _, _, err := h.obtainItem(tx, userID, rewardItem.ItemID, rewardItem.ItemType, rewardItem.Amount, requestAt)
-		if err != nil {
-			return nil, err
-		}
+		// 報酬アイテム情報を収集（後でバッチ取得）
+		rewardItems = append(rewardItems, &LoginBonusRewardMaster{
+			LoginBonusID:   bonus.ID,
+			RewardSequence: userBonus.LastRewardSequence,
+		})
 
 		// 進捗の保存
 		if initBonus {
@@ -494,6 +522,57 @@ func (h *Handler) obtainLoginBonus(tx *sqlx.Tx, userID int64, requestAt int64) (
 		sendLoginBonuses = append(sendLoginBonuses, userBonus)
 	}
 
+	// 報酬アイテムを一括取得
+	if len(rewardItems) > 0 {
+		rewardConditions := make([]string, len(rewardItems))
+		rewardParams := make([]interface{}, 0, len(rewardItems)*2)
+
+		for i, reward := range rewardItems {
+			rewardConditions[i] = "(login_bonus_id=? AND reward_sequence=?)"
+			rewardParams = append(rewardParams, reward.LoginBonusID, reward.RewardSequence)
+		}
+
+		query = fmt.Sprintf("SELECT * FROM login_bonus_reward_masters WHERE %s",
+			strings.Join(rewardConditions, " OR "))
+
+		actualRewards := make([]*LoginBonusRewardMaster, 0)
+		if err := tx.Select(&actualRewards, query, rewardParams...); err != nil {
+			return nil, err
+		}
+
+		// 報酬アイテムをマップ化
+		rewardMap := make(map[string]*LoginBonusRewardMaster)
+		for _, reward := range actualRewards {
+			key := fmt.Sprintf("%d_%d", reward.LoginBonusID, reward.RewardSequence)
+			rewardMap[key] = reward
+		}
+
+		// アイテム付与をバッチ処理用に準備
+		presents := make([]*UserPresent, 0)
+		for _, userBonus := range sendLoginBonuses {
+			key := fmt.Sprintf("%d_%d", userBonus.LoginBonusID, userBonus.LastRewardSequence)
+			rewardItem, exists := rewardMap[key]
+			if !exists {
+				return nil, ErrLoginBonusRewardNotFound
+			}
+
+			// プレゼント形式でアイテム付与情報を作成
+			presents = append(presents, &UserPresent{
+				ItemType: rewardItem.ItemType,
+				ItemID:   rewardItem.ItemID,
+				Amount:   int(rewardItem.Amount),
+			})
+		}
+
+		// バッチでアイテム付与
+		if len(presents) > 0 {
+			err = h.obtainItemsBatch(tx, presents, userID, requestAt)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	return sendLoginBonuses, nil
 }
 
@@ -505,17 +584,42 @@ func (h *Handler) obtainPresent(tx *sqlx.Tx, userID int64, requestAt int64) ([]*
 		return nil, err
 	}
 
+	if len(normalPresents) == 0 {
+		return make([]*UserPresent, 0), nil
+	}
+
+	// プレゼントIDを一括取得
+	presentIDs := make([]int64, len(normalPresents))
+	for i, np := range normalPresents {
+		presentIDs[i] = np.ID
+	}
+
+	// 既に受け取ったプレゼント履歴を一括取得
+	query = "SELECT present_all_id FROM user_present_all_received_history WHERE user_id=? AND present_all_id IN (?)"
+	query, params, err := sqlx.In(query, userID, presentIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	receivedIDs := make([]int64, 0)
+	if err := tx.Select(&receivedIDs, query, params...); err != nil {
+		return nil, err
+	}
+
+	// 受け取り済みIDをマップ化
+	receivedMap := make(map[int64]bool)
+	for _, id := range receivedIDs {
+		receivedMap[id] = true
+	}
+
+	// 未受け取りのプレゼントを処理
 	obtainPresents := make([]*UserPresent, 0)
+	histories := make([]*UserPresentAllReceivedHistory, 0)
+
 	for _, np := range normalPresents {
-		received := new(UserPresentAllReceivedHistory)
-		query = "SELECT * FROM user_present_all_received_history WHERE user_id=? AND present_all_id=?"
-		err := tx.Get(received, query, userID, np.ID)
-		if err == nil {
+		if receivedMap[np.ID] {
 			// プレゼント配布済
 			continue
-		}
-		if err != sql.ErrNoRows {
-			return nil, err
 		}
 
 		pID, err := h.generateID()
@@ -533,10 +637,6 @@ func (h *Handler) obtainPresent(tx *sqlx.Tx, userID int64, requestAt int64) ([]*
 			CreatedAt:      requestAt,
 			UpdatedAt:      requestAt,
 		}
-		query = "INSERT INTO user_presents(id, user_id, sent_at, item_type, item_id, amount, present_message, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-		if _, err := tx.Exec(query, up.ID, up.UserID, up.SentAt, up.ItemType, up.ItemID, up.Amount, up.PresentMessage, up.CreatedAt, up.UpdatedAt); err != nil {
-			return nil, err
-		}
 
 		phID, err := h.generateID()
 		if err != nil {
@@ -550,20 +650,27 @@ func (h *Handler) obtainPresent(tx *sqlx.Tx, userID int64, requestAt int64) ([]*
 			CreatedAt:    requestAt,
 			UpdatedAt:    requestAt,
 		}
-		query = "INSERT INTO user_present_all_received_history(id, user_id, present_all_id, received_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
-		if _, err := tx.Exec(
-			query,
-			history.ID,
-			history.UserID,
-			history.PresentAllID,
-			history.ReceivedAt,
-			history.CreatedAt,
-			history.UpdatedAt,
-		); err != nil {
-			return nil, err
-		}
 
 		obtainPresents = append(obtainPresents, up)
+		histories = append(histories, history)
+	}
+
+	// プレゼントを一括挿入
+	if len(obtainPresents) > 0 {
+		for _, up := range obtainPresents {
+			query = "INSERT INTO user_presents(id, user_id, sent_at, item_type, item_id, amount, present_message, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+			if _, err := tx.Exec(query, up.ID, up.UserID, up.SentAt, up.ItemType, up.ItemID, up.Amount, up.PresentMessage, up.CreatedAt, up.UpdatedAt); err != nil {
+				return nil, err
+			}
+		}
+
+		// 履歴を一括挿入
+		for _, history := range histories {
+			query = "INSERT INTO user_present_all_received_history(id, user_id, present_all_id, received_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+			if _, err := tx.Exec(query, history.ID, history.UserID, history.PresentAllID, history.ReceivedAt, history.CreatedAt, history.UpdatedAt); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	return obtainPresents, nil
@@ -677,6 +784,151 @@ func (h *Handler) obtainItem(tx *sqlx.Tx, userID, itemID int64, itemType int, ob
 	}
 
 	return obtainCoins, obtainCards, obtainItems, nil
+}
+
+// obtainItemsBatch アイテム付与処理のバッチ版
+func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID int64, requestAt int64) error {
+	// アイテム種別ごとにグループ化
+	coinTotal := int64(0)
+	cardItems := make([]*UserPresent, 0)
+	materialItems := make(map[int64]int64) // item_id -> total_amount
+
+	for _, present := range presents {
+		switch present.ItemType {
+		case 1: // coin
+			coinTotal += int64(present.Amount)
+		case 2: // card(ハンマー)
+			cardItems = append(cardItems, present)
+		case 3, 4: // 強化素材
+			materialItems[present.ItemID] += int64(present.Amount)
+		}
+	}
+
+	// コインの一括更新
+	if coinTotal > 0 {
+		query := "UPDATE users SET isu_coin = isu_coin + ? WHERE id = ?"
+		if _, err := tx.Exec(query, coinTotal, userID); err != nil {
+			return err
+		}
+	}
+
+	// カードの一括挿入
+	if len(cardItems) > 0 {
+		// カードマスター情報を一括取得
+		cardIDs := make([]int64, len(cardItems))
+		for i, item := range cardItems {
+			cardIDs[i] = item.ItemID
+		}
+
+		query := "SELECT * FROM item_masters WHERE id IN (?) AND item_type = 2"
+		query, params, err := sqlx.In(query, cardIDs)
+		if err != nil {
+			return err
+		}
+
+		itemMasters := make([]*ItemMaster, 0)
+		if err := tx.Select(&itemMasters, query, params...); err != nil {
+			return err
+		}
+
+		// マスター情報をマップ化
+		masterMap := make(map[int64]*ItemMaster)
+		for _, master := range itemMasters {
+			masterMap[master.ID] = master
+		}
+
+		// カードを一括挿入
+		for _, item := range cardItems {
+			master, exists := masterMap[item.ItemID]
+			if !exists {
+				return ErrItemNotFound
+			}
+
+			for i := 0; i < item.Amount; i++ {
+				cID, err := h.generateID()
+				if err != nil {
+					return err
+				}
+
+				query := "INSERT INTO user_cards(id, user_id, card_id, amount_per_sec, level, total_exp, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+				if _, err := tx.Exec(query, cID, userID, master.ID, *master.AmountPerSec, 1, 0, requestAt, requestAt); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// 強化素材の一括更新
+	if len(materialItems) > 0 {
+		// 既存のアイテムを取得
+		itemIDs := make([]int64, 0, len(materialItems))
+		for itemID := range materialItems {
+			itemIDs = append(itemIDs, itemID)
+		}
+
+		query := "SELECT * FROM user_items WHERE user_id = ? AND item_id IN (?)"
+		query, params, err := sqlx.In(query, userID, itemIDs)
+		if err != nil {
+			return err
+		}
+
+		existingItems := make([]*UserItem, 0)
+		if err := tx.Select(&existingItems, query, params...); err != nil {
+			return err
+		}
+
+		// 既存アイテムをマップ化
+		existingMap := make(map[int64]*UserItem)
+		for _, item := range existingItems {
+			existingMap[item.ItemID] = item
+		}
+
+		// アイテムマスター情報を取得
+		query = "SELECT * FROM item_masters WHERE id IN (?) AND item_type IN (3, 4)"
+		query, params, err = sqlx.In(query, itemIDs)
+		if err != nil {
+			return err
+		}
+
+		itemMasters := make([]*ItemMaster, 0)
+		if err := tx.Select(&itemMasters, query, params...); err != nil {
+			return err
+		}
+
+		masterMap := make(map[int64]*ItemMaster)
+		for _, master := range itemMasters {
+			masterMap[master.ID] = master
+		}
+
+		// 更新・挿入処理
+		for itemID, amount := range materialItems {
+			master, exists := masterMap[itemID]
+			if !exists {
+				return ErrItemNotFound
+			}
+
+			if existingItem, exists := existingMap[itemID]; exists {
+				// 既存アイテムの更新
+				query := "UPDATE user_items SET amount = amount + ?, updated_at = ? WHERE id = ?"
+				if _, err := tx.Exec(query, amount, requestAt, existingItem.ID); err != nil {
+					return err
+				}
+			} else {
+				// 新規アイテムの挿入
+				uitemID, err := h.generateID()
+				if err != nil {
+					return err
+				}
+
+				query := "INSERT INTO user_items(id, user_id, item_id, item_type, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+				if _, err := tx.Exec(query, uitemID, userID, itemID, master.ItemType, amount, requestAt, requestAt); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // initialize 初期化処理
@@ -1240,8 +1492,10 @@ func (h *Handler) drawGacha(c echo.Context) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// プレゼントにガチャ結果を付与する
+	// プレゼントにガチャ結果を付与する（バッチ化）
 	presents := make([]*UserPresent, 0, gachaCount)
+	presentMessage := fmt.Sprintf("%sの付与アイテムです", gachaInfo.Name)
+
 	for _, v := range result {
 		pID, err := h.generateID()
 		if err != nil {
@@ -1254,18 +1508,26 @@ func (h *Handler) drawGacha(c echo.Context) error {
 			ItemType:       v.ItemType,
 			ItemID:         v.ItemID,
 			Amount:         v.Amount,
-			PresentMessage: fmt.Sprintf("%sの付与アイテムです", gachaInfo.Name),
+			PresentMessage: presentMessage,
 			CreatedAt:      requestAt,
 			UpdatedAt:      requestAt,
 		}
-		query = "INSERT INTO user_presents(id, user_id, sent_at, item_type, item_id, amount, present_message, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-		if _, err := tx.Exec(query, present.ID, present.UserID, present.SentAt, present.ItemType, present.ItemID, present.Amount, present.PresentMessage, present.CreatedAt, present.UpdatedAt); err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
-		}
-
 		presents = append(presents, present)
 	}
 
+	// プレゼントを一括挿入（NamedExecを使用）
+	if len(presents) > 0 {
+		query = `INSERT INTO user_presents(id, user_id, sent_at, item_type, item_id, amount, present_message, created_at, updated_at)
+				 VALUES (:id, :user_id, :sent_at, :item_type, :item_id, :amount, :present_message, :created_at, :updated_at)`
+
+		for _, present := range presents {
+			if _, err := tx.NamedExec(query, present); err != nil {
+				return errorResponse(c, http.StatusInternalServerError, err)
+			}
+		}
+	}
+
+	// コイン消費
 	query = "UPDATE users SET isu_coin=? WHERE id=?"
 	totalCoin := user.IsuCoin - consumedCoin
 	if _, err := tx.Exec(query, totalCoin, user.ID); err != nil {
@@ -1398,31 +1660,38 @@ func (h *Handler) receivePresent(c echo.Context) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// 配布処理
+	// プレゼントの削除処理をバッチ化
+	presentIDs := make([]int64, len(obtainPresent))
 	for i := range obtainPresent {
 		if obtainPresent[i].DeletedAt != nil {
 			return errorResponse(c, http.StatusInternalServerError, fmt.Errorf("received present"))
 		}
-
 		obtainPresent[i].UpdatedAt = requestAt
 		obtainPresent[i].DeletedAt = &requestAt
-		v := obtainPresent[i]
-		query = "UPDATE user_presents SET deleted_at=?, updated_at=? WHERE id=?"
-		_, err := tx.Exec(query, requestAt, requestAt, v.ID)
-		if err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
-		}
+		presentIDs[i] = obtainPresent[i].ID
+	}
 
-		_, _, _, err = h.obtainItem(tx, v.UserID, v.ItemID, v.ItemType, int64(v.Amount), requestAt)
-		if err != nil {
-			if err == ErrUserNotFound || err == ErrItemNotFound {
-				return errorResponse(c, http.StatusNotFound, err)
-			}
-			if err == ErrInvalidItemType {
-				return errorResponse(c, http.StatusBadRequest, err)
-			}
-			return errorResponse(c, http.StatusInternalServerError, err)
+	// プレゼントを一括で削除済みにマーク
+	query = "UPDATE user_presents SET deleted_at=?, updated_at=? WHERE id IN (?)"
+	query, params, err = sqlx.In(query, requestAt, requestAt, presentIDs)
+	if err != nil {
+		return errorResponse(c, http.StatusInternalServerError, err)
+	}
+	_, err = tx.Exec(query, params...)
+	if err != nil {
+		return errorResponse(c, http.StatusInternalServerError, err)
+	}
+
+	// アイテム付与処理をバッチ化
+	err = h.obtainItemsBatch(tx, obtainPresent, userID, requestAt)
+	if err != nil {
+		if err == ErrUserNotFound || err == ErrItemNotFound {
+			return errorResponse(c, http.StatusNotFound, err)
 		}
+		if err == ErrInvalidItemType {
+			return errorResponse(c, http.StatusBadRequest, err)
+		}
+		return errorResponse(c, http.StatusInternalServerError, err)
 	}
 
 	err = tx.Commit()
@@ -1989,25 +2258,9 @@ func noContentResponse(c echo.Context, status int) error {
 
 // generateID ユニークなIDを生成する
 func (h *Handler) generateID() (int64, error) {
-	var updateErr error
-	for i := 0; i < 100; i++ {
-		res, err := h.DB.Exec("UPDATE id_generator SET id=LAST_INSERT_ID(id+1)")
-		if err != nil {
-			if merr, ok := err.(*mysql.MySQLError); ok && merr.Number == 1213 {
-				updateErr = err
-				continue
-			}
-			return 0, err
-		}
+	id := snowflakeNode.Generate()
 
-		id, err := res.LastInsertId()
-		if err != nil {
-			return 0, err
-		}
-		return id, nil
-	}
-
-	return 0, fmt.Errorf("failed to generate id: %w", updateErr)
+	return id.Int64(), nil
 }
 
 // generateUUID UUIDの生成
