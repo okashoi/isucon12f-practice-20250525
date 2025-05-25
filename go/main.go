@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -47,7 +46,7 @@ const (
 	DeckCardNumber      int = 3
 	PresentCountPerPage int = 100
 
-	SQLDirectory string = "/home/isucon/webapp/sql/"
+	SQLDirectory string = "/sql/"
 )
 
 type Handler struct {
@@ -96,6 +95,7 @@ func main() {
 
 	// utility
 	e.POST("/initialize", initialize)
+	e.POST("/initializeOne", initializeOne)
 	e.GET("/health", h.health)
 
 	// feature
@@ -681,27 +681,37 @@ func (h *Handler) obtainItem(tx *sqlx.Tx, userID, itemID int64, itemType int, ob
 
 // initialize 初期化処理
 // POST /initialize
-// POST /initialize
 func initialize(c echo.Context) error {
-	var dbHostNames = []string{"isucon-s2", "isucon-s3"}
-	errCh := make(chan error, len(dbHostNames))
+	dbx, err := connectDB(true)
+	if err != nil {
+		return errorResponse(c, http.StatusInternalServerError, err)
+	}
+	defer dbx.Close()
+
+	errCh := make(chan error, len(dbHosts))
 	wg := sync.WaitGroup{}
+
 	defer close(errCh)
 
-	for _, host := range dbHostNames {
+	for _, host := range dbHosts {
 		wg.Add(1)
 		go func(host string) {
 			defer wg.Done()
 
-			err := runInitViaSSH(host)
+			resp, err := http.Post(fmt.Sprintf("http://%s:8080/initializeOne", host), "application/json", nil)
 			if err != nil {
-				errCh <- fmt.Errorf("host %s: %w", host, err)
+				errCh <- err
+				return
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				errCh <- fmt.Errorf("CODE: %d", resp.StatusCode)
+				return
 			}
 		}(host)
 	}
 
 	wg.Wait()
-
 	if len(errCh) > 0 {
 		return errorResponse(c, http.StatusInternalServerError, <-errCh)
 	}
@@ -711,36 +721,16 @@ func initialize(c echo.Context) error {
 	})
 }
 
-// SSHでinit.shを実行する
-func runInitViaSSH(host string) error {
-	user := "isucon"
-	cmd := exec.Command(
-		"ssh",
-		fmt.Sprintf("%s@%s", user, host),
-		fmt.Sprintf("cd %s && ./init.sh", SQLDirectory),
-	)
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-
-	// タイムアウト制御（必要に応じて）
-	cmdDone := make(chan error, 1)
-	go func() {
-		cmdDone <- cmd.Run()
-	}()
-
-	select {
-	case err := <-cmdDone:
-		if err != nil {
-			return fmt.Errorf("ssh command failed on %s: %v, output: %s", host, err, out.String())
-		}
-	case <-time.After(10 * time.Second):
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("ssh command timed out on %s", host)
+func initializeOne(c echo.Context) error {
+	out, err := exec.Command("/bin/sh", "-c", SQLDirectory+"init.sh").CombinedOutput()
+	if err != nil {
+		c.Logger().Errorf("Failed to initialize %s: %v", string(out), err)
+		return errorResponse(c, http.StatusInternalServerError, err)
 	}
 
-	return nil
+	return successResponse(c, &InitializeResponse{
+		Language: "go",
+	})
 }
 
 type InitializeResponse struct {
