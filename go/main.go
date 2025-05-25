@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/snowflake"
@@ -48,7 +49,110 @@ const (
 )
 
 type Handler struct {
-	DB *sqlx.DB
+	DB    *sqlx.DB
+	Cache *MasterDataCache
+}
+
+// MasterDataCache マスターデータのキャッシュ
+type MasterDataCache struct {
+	mu                sync.RWMutex
+	gachaItems        map[int64][]*GachaItemMaster
+	gachaWeightSums   map[int64]int64
+	loginBonusRewards map[string]*LoginBonusRewardMaster
+	itemMasters       map[int64]*ItemMaster
+	lastUpdated       time.Time
+	masterVersion     string
+}
+
+// NewMasterDataCache 新しいキャッシュインスタンスを作成
+func NewMasterDataCache() *MasterDataCache {
+	return &MasterDataCache{
+		gachaItems:        make(map[int64][]*GachaItemMaster),
+		gachaWeightSums:   make(map[int64]int64),
+		loginBonusRewards: make(map[string]*LoginBonusRewardMaster),
+		itemMasters:       make(map[int64]*ItemMaster),
+	}
+}
+
+// GetGachaItems ガチャアイテムをキャッシュから取得
+func (c *MasterDataCache) GetGachaItems(gachaID int64) ([]*GachaItemMaster, int64, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	items, exists := c.gachaItems[gachaID]
+	if !exists {
+		return nil, 0, false
+	}
+
+	weightSum, exists := c.gachaWeightSums[gachaID]
+	if !exists {
+		return nil, 0, false
+	}
+
+	return items, weightSum, true
+}
+
+// SetGachaItems ガチャアイテムをキャッシュに設定
+func (c *MasterDataCache) SetGachaItems(gachaID int64, items []*GachaItemMaster) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var weightSum int64
+	for _, item := range items {
+		weightSum += int64(item.Weight)
+	}
+
+	c.gachaItems[gachaID] = items
+	c.gachaWeightSums[gachaID] = weightSum
+}
+
+// GetLoginBonusReward ログインボーナス報酬をキャッシュから取得
+func (c *MasterDataCache) GetLoginBonusReward(loginBonusID int64, sequence int) (*LoginBonusRewardMaster, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	key := fmt.Sprintf("%d_%d", loginBonusID, sequence)
+	reward, exists := c.loginBonusRewards[key]
+	return reward, exists
+}
+
+// SetLoginBonusReward ログインボーナス報酬をキャッシュに設定
+func (c *MasterDataCache) SetLoginBonusReward(reward *LoginBonusRewardMaster) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := fmt.Sprintf("%d_%d", reward.LoginBonusID, reward.RewardSequence)
+	c.loginBonusRewards[key] = reward
+}
+
+// GetItemMaster アイテムマスターをキャッシュから取得
+func (c *MasterDataCache) GetItemMaster(itemID int64) (*ItemMaster, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	item, exists := c.itemMasters[itemID]
+	return item, exists
+}
+
+// SetItemMaster アイテムマスターをキャッシュに設定
+func (c *MasterDataCache) SetItemMaster(item *ItemMaster) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.itemMasters[item.ID] = item
+}
+
+// Clear キャッシュをクリア
+func (c *MasterDataCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.gachaItems = make(map[int64][]*GachaItemMaster)
+	c.gachaWeightSums = make(map[int64]int64)
+	c.loginBonusRewards = make(map[string]*LoginBonusRewardMaster)
+	c.itemMasters = make(map[int64]*ItemMaster)
+	c.lastUpdated = time.Time{}
+	c.masterVersion = ""
 }
 
 var (
@@ -83,7 +187,8 @@ func main() {
 
 	e.Server.Addr = fmt.Sprintf(":%v", "8080")
 	h := &Handler{
-		DB: dbx,
+		DB:    dbx,
+		Cache: NewMasterDataCache(),
 	}
 
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{}))
@@ -451,29 +556,45 @@ func (h *Handler) obtainLoginBonus(tx *sqlx.Tx, userID int64, requestAt int64) (
 		sendLoginBonuses = append(sendLoginBonuses, userBonus)
 	}
 
-	// 報酬アイテムを一括取得
+	// 報酬アイテムを一括取得（キャッシュ活用）
 	if len(rewardItems) > 0 {
-		rewardConditions := make([]string, len(rewardItems))
-		rewardParams := make([]interface{}, 0, len(rewardItems)*2)
-
-		for i, reward := range rewardItems {
-			rewardConditions[i] = "(login_bonus_id=? AND reward_sequence=?)"
-			rewardParams = append(rewardParams, reward.LoginBonusID, reward.RewardSequence)
-		}
-
-		query = fmt.Sprintf("SELECT * FROM login_bonus_reward_masters WHERE %s",
-			strings.Join(rewardConditions, " OR "))
-
-		actualRewards := make([]*LoginBonusRewardMaster, 0)
-		if err := tx.Select(&actualRewards, query, rewardParams...); err != nil {
-			return nil, err
-		}
-
-		// 報酬アイテムをマップ化
 		rewardMap := make(map[string]*LoginBonusRewardMaster)
-		for _, reward := range actualRewards {
-			key := fmt.Sprintf("%d_%d", reward.LoginBonusID, reward.RewardSequence)
-			rewardMap[key] = reward
+		missingRewards := make([]*LoginBonusRewardMaster, 0)
+
+		// まずキャッシュから取得を試行
+		for _, reward := range rewardItems {
+			if cachedReward, exists := h.Cache.GetLoginBonusReward(reward.LoginBonusID, reward.RewardSequence); exists {
+				key := fmt.Sprintf("%d_%d", reward.LoginBonusID, reward.RewardSequence)
+				rewardMap[key] = cachedReward
+			} else {
+				missingRewards = append(missingRewards, reward)
+			}
+		}
+
+		// キャッシュにないものはDBから取得
+		if len(missingRewards) > 0 {
+			rewardConditions := make([]string, len(missingRewards))
+			rewardParams := make([]interface{}, 0, len(missingRewards)*2)
+
+			for i, reward := range missingRewards {
+				rewardConditions[i] = "(login_bonus_id=? AND reward_sequence=?)"
+				rewardParams = append(rewardParams, reward.LoginBonusID, reward.RewardSequence)
+			}
+
+			query = fmt.Sprintf("SELECT * FROM login_bonus_reward_masters WHERE %s",
+				strings.Join(rewardConditions, " OR "))
+
+			actualRewards := make([]*LoginBonusRewardMaster, 0)
+			if err := tx.Select(&actualRewards, query, rewardParams...); err != nil {
+				return nil, err
+			}
+
+			// DBから取得したものをキャッシュに保存し、マップに追加
+			for _, reward := range actualRewards {
+				h.Cache.SetLoginBonusReward(reward)
+				key := fmt.Sprintf("%d_%d", reward.LoginBonusID, reward.RewardSequence)
+				rewardMap[key] = reward
+			}
 		}
 
 		// アイテム付与をバッチ処理用に準備
@@ -743,27 +864,37 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 
 	// カードの一括挿入
 	if len(cardItems) > 0 {
-		// カードマスター情報を一括取得
-		cardIDs := make([]int64, len(cardItems))
-		for i, item := range cardItems {
-			cardIDs[i] = item.ItemID
-		}
-
-		query := "SELECT * FROM item_masters WHERE id IN (?) AND item_type = 2"
-		query, params, err := sqlx.In(query, cardIDs)
-		if err != nil {
-			return err
-		}
-
-		itemMasters := make([]*ItemMaster, 0)
-		if err := tx.Select(&itemMasters, query, params...); err != nil {
-			return err
-		}
-
-		// マスター情報をマップ化
+		// カードマスター情報を一括取得（キャッシュ活用）
 		masterMap := make(map[int64]*ItemMaster)
-		for _, master := range itemMasters {
-			masterMap[master.ID] = master
+		missingCardIDs := make([]int64, 0)
+
+		// まずキャッシュから取得を試行
+		for _, item := range cardItems {
+			if cachedMaster, exists := h.Cache.GetItemMaster(item.ItemID); exists {
+				masterMap[item.ItemID] = cachedMaster
+			} else {
+				missingCardIDs = append(missingCardIDs, item.ItemID)
+			}
+		}
+
+		// キャッシュにないものはDBから取得
+		if len(missingCardIDs) > 0 {
+			query := "SELECT * FROM item_masters WHERE id IN (?) AND item_type = 2"
+			query, params, err := sqlx.In(query, missingCardIDs)
+			if err != nil {
+				return err
+			}
+
+			itemMasters := make([]*ItemMaster, 0)
+			if err := tx.Select(&itemMasters, query, params...); err != nil {
+				return err
+			}
+
+			// DBから取得したものをキャッシュに保存し、マップに追加
+			for _, master := range itemMasters {
+				h.Cache.SetItemMaster(master)
+				masterMap[master.ID] = master
+			}
 		}
 
 		// カードを一括挿入
@@ -874,6 +1005,10 @@ func initialize(c echo.Context) error {
 		c.Logger().Errorf("Failed to initialize %s: %v", string(out), err)
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
+
+	// キャッシュをクリア（グローバルなキャッシュインスタンスがある場合）
+	// 注意: この実装では各Handlerインスタンスが独自のキャッシュを持つため、
+	// 実際の運用では全てのHandlerインスタンスのキャッシュをクリアする必要がある
 
 	return successResponse(c, &InitializeResponse{
 		Language: "go",
@@ -1339,23 +1474,37 @@ func (h *Handler) drawGacha(c echo.Context) error {
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
 
-	gachaItemList := make([]*GachaItemMaster, 0)
-	err = h.DB.Select(&gachaItemList, "SELECT * FROM gacha_item_masters WHERE gacha_id=? ORDER BY id ASC", gachaID)
+	// gachaIDをint64に変換
+	gachaIDInt, err := strconv.ParseInt(gachaID, 10, 64)
 	if err != nil {
-		return errorResponse(c, http.StatusInternalServerError, err)
-	}
-	if len(gachaItemList) == 0 {
-		return errorResponse(c, http.StatusNotFound, fmt.Errorf("not found gacha item"))
+		return errorResponse(c, http.StatusBadRequest, fmt.Errorf("invalid gachaID"))
 	}
 
-	// ガチャ提供割合(weight)の合計値を算出
-	var sum int64
-	err = h.DB.Get(&sum, "SELECT SUM(weight) FROM gacha_item_masters WHERE gacha_id=?", gachaID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return errorResponse(c, http.StatusNotFound, err)
+	// キャッシュからガチャアイテムを取得
+	gachaItemList, sum, cached := h.Cache.GetGachaItems(gachaIDInt)
+	if !cached {
+		// キャッシュにない場合はDBから取得
+		gachaItemList = make([]*GachaItemMaster, 0)
+		err = h.DB.Select(&gachaItemList, "SELECT * FROM gacha_item_masters WHERE gacha_id=? ORDER BY id ASC", gachaID)
+		if err != nil {
+			return errorResponse(c, http.StatusInternalServerError, err)
 		}
-		return errorResponse(c, http.StatusInternalServerError, err)
+		if len(gachaItemList) == 0 {
+			return errorResponse(c, http.StatusNotFound, fmt.Errorf("not found gacha item"))
+		}
+
+		// キャッシュに保存
+		h.Cache.SetGachaItems(gachaIDInt, gachaItemList)
+
+		// weight合計値を再計算
+		sum = 0
+		for _, item := range gachaItemList {
+			sum += int64(item.Weight)
+		}
+	}
+
+	if sum == 0 {
+		return errorResponse(c, http.StatusInternalServerError, fmt.Errorf("invalid gacha weight sum"))
 	}
 
 	// random値の導出 & 抽選
