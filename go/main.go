@@ -976,9 +976,11 @@ func initialize(c echo.Context) error {
 func initializeOne(c echo.Context) error {
 	out, err := exec.Command("/bin/sh", "-c", SQLDirectory+"init.sh").CombinedOutput()
 	if err != nil {
-		c.Logger().Errorf("Failed to initialize %s: %v", string(out), err)
+		c.Logger().Errorf("init.sh 実行失敗: %s\nエラー: %v", string(out), err)
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
+
+	c.Logger().Infof("init.sh 実行成功: %s", string(out))
 
 	return successResponse(c, &InitializeResponse{
 		Language: "go",
