@@ -13,8 +13,8 @@ stop-services:
 
 build:
 	cd go && go build -o isuconquest
-	scp isuconquest isucon-s2:~/webapp/go/isuconquest
-	scp isuconquest isucon-s3:~/webapp/go/isuconquest
+	scp go/isuconquest isucon-s2:~/webapp/go/isuconquest
+	scp go/isuconquest isucon-s3:~/webapp/go/isuconquest
 
 logs: limit=100000
 logs: opts=
