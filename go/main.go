@@ -683,11 +683,12 @@ func (h *Handler) obtainItem(tx *sqlx.Tx, userID, itemID int64, itemType int, ob
 // POST /initialize
 // POST /initialize
 func initialize(c echo.Context) error {
-	errCh := make(chan error, len(dbHosts))
+	var dbHostNames = []string{"isucon-s2", "isucon-s3"}
+	errCh := make(chan error, len(dbHostNames))
 	wg := sync.WaitGroup{}
 	defer close(errCh)
 
-	for _, host := range dbHosts {
+	for _, host := range dbHostNames {
 		wg.Add(1)
 		go func(host string) {
 			defer wg.Done()
