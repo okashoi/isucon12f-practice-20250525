@@ -1017,20 +1017,12 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			}
 		}
 
-		// 複数VALUES句を使った真の一括INSERT
+		// NamedExecを使った一括INSERT
 		if len(cardInserts) > 0 {
-			valueStrings := make([]string, len(cardInserts))
-			valueArgs := make([]interface{}, 0, len(cardInserts)*8)
+			query := `INSERT INTO user_cards(id, user_id, card_id, amount_per_sec, level, total_exp, created_at, updated_at)
+					  VALUES (:id, :user_id, :card_id, :amount_per_sec, :level, :total_exp, :created_at, :updated_at)`
 
-			for i, card := range cardInserts {
-				valueStrings[i] = "(?, ?, ?, ?, ?, ?, ?, ?)"
-				valueArgs = append(valueArgs, card.ID, card.UserID, card.CardID, card.AmountPerSec, card.Level, card.TotalExp, card.CreatedAt, card.UpdatedAt)
-			}
-
-			query := fmt.Sprintf("INSERT INTO user_cards(id, user_id, card_id, amount_per_sec, level, total_exp, created_at, updated_at) VALUES %s",
-				strings.Join(valueStrings, ","))
-
-			if _, err := tx.Exec(query, valueArgs...); err != nil {
+			if _, err := tx.NamedExec(query, cardInserts); err != nil {
 				return err
 			}
 		}
@@ -1146,20 +1138,12 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			}
 		}
 
-		// 一括INSERT（複数VALUES句使用）
+		// NamedExecを使った一括INSERT
 		if len(insertItems) > 0 {
-			valueStrings := make([]string, len(insertItems))
-			valueArgs := make([]interface{}, 0, len(insertItems)*7)
+			query := `INSERT INTO user_items(id, user_id, item_id, item_type, amount, created_at, updated_at)
+					  VALUES (:id, :user_id, :item_id, :item_type, :amount, :created_at, :updated_at)`
 
-			for i, item := range insertItems {
-				valueStrings[i] = "(?, ?, ?, ?, ?, ?, ?)"
-				valueArgs = append(valueArgs, item.ID, item.UserID, item.ItemID, item.ItemType, item.Amount, item.CreatedAt, item.UpdatedAt)
-			}
-
-			query := fmt.Sprintf("INSERT INTO user_items(id, user_id, item_id, item_type, amount, created_at, updated_at) VALUES %s",
-				strings.Join(valueStrings, ","))
-
-			if _, err := tx.Exec(query, valueArgs...); err != nil {
+			if _, err := tx.NamedExec(query, insertItems); err != nil {
 				return err
 			}
 		}
