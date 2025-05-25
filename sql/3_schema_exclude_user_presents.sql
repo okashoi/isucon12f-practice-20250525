@@ -261,5 +261,3 @@ CREATE TABLE `admin_users` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-
-ALTER TABLE user_presents ADD INDEX (user_id, deleted_at, created_at DESC);
