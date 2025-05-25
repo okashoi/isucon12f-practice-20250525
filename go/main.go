@@ -1127,13 +1127,18 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 				updateIDs = append(updateIDs, item.ID)
 			}
 
+			placeholders := strings.Repeat("?,", len(updateItems))
+			if len(placeholders) > 0 {
+				placeholders = placeholders[:len(placeholders)-1] // 最後のカンマを削除
+			}
+
 			query := fmt.Sprintf(`UPDATE user_items SET
 				amount = CASE id %s END,
 				updated_at = CASE id %s END
 				WHERE id IN (%s)`,
 				strings.Join(caseWhenAmount, " "),
 				strings.Join(caseWhenUpdated, " "),
-				strings.Repeat("?,", len(updateItems))[:len(updateItems)*2-1])
+				placeholders)
 
 			allArgs := append(updateArgs, updateIDs...)
 			if _, err := tx.Exec(query, allArgs...); err != nil {
