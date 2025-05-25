@@ -307,6 +307,11 @@ func connectDB(batch bool) (*sqlx.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	dbx.SetMaxOpenConns(100)                  // 最大接続数を100に設定
+	dbx.SetMaxIdleConns(100)                  // アイドル接続数も100に設定
+	dbx.SetConnMaxLifetime(300 * time.Second) // 接続の最大生存時間を5分に設定
+
 	return dbx, nil
 }
 
