@@ -49,8 +49,9 @@ const (
 )
 
 type Handler struct {
-	DB    *sqlx.DB
-	Cache *MasterDataCache
+	DB         *sqlx.DB
+	Cache      *MasterDataCache
+	TokenCache *TokenCache
 }
 
 // MasterDataCache マスターデータのキャッシュ
@@ -64,6 +65,20 @@ type MasterDataCache struct {
 	masterVersion     string
 }
 
+// TokenCache ワンタイムトークンのキャッシュ
+type TokenCache struct {
+	mu     sync.RWMutex
+	tokens map[string]*TokenInfo
+}
+
+// TokenInfo トークン情報
+type TokenInfo struct {
+	UserID    int64
+	TokenType int
+	ExpiredAt int64
+	CreatedAt int64
+}
+
 // NewMasterDataCache 新しいキャッシュインスタンスを作成
 func NewMasterDataCache() *MasterDataCache {
 	return &MasterDataCache{
@@ -71,6 +86,55 @@ func NewMasterDataCache() *MasterDataCache {
 		gachaWeightSums:   make(map[int64]int64),
 		loginBonusRewards: make(map[string]*LoginBonusRewardMaster),
 		itemMasters:       make(map[int64]*ItemMaster),
+	}
+}
+
+// NewTokenCache 新しいトークンキャッシュインスタンスを作成
+func NewTokenCache() *TokenCache {
+	return &TokenCache{
+		tokens: make(map[string]*TokenInfo),
+	}
+}
+
+// SetToken トークンをキャッシュに設定
+func (tc *TokenCache) SetToken(token string, userID int64, tokenType int, expiredAt int64, createdAt int64) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	tc.tokens[token] = &TokenInfo{
+		UserID:    userID,
+		TokenType: tokenType,
+		ExpiredAt: expiredAt,
+		CreatedAt: createdAt,
+	}
+}
+
+// GetToken トークンをキャッシュから取得
+func (tc *TokenCache) GetToken(token string) (*TokenInfo, bool) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+
+	tokenInfo, exists := tc.tokens[token]
+	return tokenInfo, exists
+}
+
+// DeleteToken トークンをキャッシュから削除
+func (tc *TokenCache) DeleteToken(token string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	delete(tc.tokens, token)
+}
+
+// CleanupExpiredTokens 期限切れトークンをクリーンアップ
+func (tc *TokenCache) CleanupExpiredTokens(currentTime int64) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	for token, info := range tc.tokens {
+		if info.ExpiredAt < currentTime {
+			delete(tc.tokens, token)
+		}
 	}
 }
 
@@ -187,8 +251,9 @@ func main() {
 
 	e.Server.Addr = fmt.Sprintf(":%v", "8080")
 	h := &Handler{
-		DB:    dbx,
-		Cache: NewMasterDataCache(),
+		DB:         dbx,
+		Cache:      NewMasterDataCache(),
+		TokenCache: NewTokenCache(),
 	}
 
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{}))
@@ -350,6 +415,34 @@ func (h *Handler) checkSessionMiddleware(next echo.HandlerFunc) echo.HandlerFunc
 
 // checkOneTimeToken ワンタイムトークンの確認用middleware
 func (h *Handler) checkOneTimeToken(token string, tokenType int, requestAt int64) error {
+	// まずキャッシュから確認
+	if tokenInfo, exists := h.TokenCache.GetToken(token); exists {
+		// トークンタイプが一致しない場合
+		if tokenInfo.TokenType != tokenType {
+			return ErrInvalidToken
+		}
+
+		// 期限切れの場合
+		if tokenInfo.ExpiredAt < requestAt {
+			h.TokenCache.DeleteToken(token)
+			// DBからも削除
+			query := "UPDATE user_one_time_tokens SET deleted_at=? WHERE token=?"
+			h.DB.Exec(query, requestAt, token)
+			return ErrInvalidToken
+		}
+
+		// 使用済みとしてキャッシュから削除
+		h.TokenCache.DeleteToken(token)
+		// DBからも削除
+		query := "UPDATE user_one_time_tokens SET deleted_at=? WHERE token=?"
+		if _, err := h.DB.Exec(query, requestAt, token); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	// キャッシュにない場合はDBから確認（フォールバック）
 	tk := new(UserOneTimeToken)
 	query := "SELECT * FROM user_one_time_tokens WHERE token=? AND token_type=? AND deleted_at IS NULL"
 	if err := h.DB.Get(tk, query, token, tokenType); err != nil {
@@ -1389,6 +1482,9 @@ func (h *Handler) listGacha(c echo.Context) error {
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
 
+	// キャッシュにも保存
+	h.TokenCache.SetToken(token.Token, token.UserID, token.TokenType, token.ExpiredAt, token.CreatedAt)
+
 	return successResponse(c, &ListGachaResponse{
 		OneTimeToken: token.Token,
 		Gachas:       gachaDataList,
@@ -1802,6 +1898,9 @@ func (h *Handler) listItem(c echo.Context) error {
 	if _, err = h.DB.Exec(query, token.ID, token.UserID, token.Token, token.TokenType, token.CreatedAt, token.UpdatedAt, token.ExpiredAt); err != nil {
 		return errorResponse(c, http.StatusInternalServerError, err)
 	}
+
+	// キャッシュにも保存
+	h.TokenCache.SetToken(token.Token, token.UserID, token.TokenType, token.ExpiredAt, token.CreatedAt)
 
 	return successResponse(c, &ListItemResponse{
 		OneTimeToken: token.Token,
