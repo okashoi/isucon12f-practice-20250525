@@ -1063,7 +1063,8 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			}
 		}
 
-		// カードを一括挿入
+		// カードを一括挿入（真のバルク処理）
+		cardInserts := make([]*UserCard, 0)
 		for _, item := range cardItems {
 			master, exists := masterMap[item.ItemID]
 			if !exists {
@@ -1076,10 +1077,26 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 					return err
 				}
 
-				query := "INSERT INTO user_cards(id, user_id, card_id, amount_per_sec, level, total_exp, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-				if _, err := tx.Exec(query, cID, userID, master.ID, *master.AmountPerSec, 1, 0, requestAt, requestAt); err != nil {
-					return err
-				}
+				cardInserts = append(cardInserts, &UserCard{
+					ID:           cID,
+					UserID:       userID,
+					CardID:       master.ID,
+					AmountPerSec: *master.AmountPerSec,
+					Level:        1,
+					TotalExp:     0,
+					CreatedAt:    requestAt,
+					UpdatedAt:    requestAt,
+				})
+			}
+		}
+
+		// NamedExecを使った一括INSERT
+		if len(cardInserts) > 0 {
+			query := `INSERT INTO user_cards(id, user_id, card_id, amount_per_sec, level, total_exp, created_at, updated_at)
+					  VALUES (:id, :user_id, :card_id, :amount_per_sec, :level, :total_exp, :created_at, :updated_at)`
+
+			if _, err := tx.NamedExec(query, cardInserts); err != nil {
+				return err
 			}
 		}
 	}
@@ -1126,7 +1143,10 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			masterMap[master.ID] = master
 		}
 
-		// 更新・挿入処理
+		// 更新・挿入処理（NamedExec使用）
+		updateItems := make([]*UserItem, 0)
+		insertItems := make([]*UserItem, 0)
+
 		for itemID, amount := range materialItems {
 			master, exists := masterMap[itemID]
 			if !exists {
@@ -1135,10 +1155,9 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 
 			if existingItem, exists := existingMap[itemID]; exists {
 				// 既存アイテムの更新
-				query := "UPDATE user_items SET amount = amount + ?, updated_at = ? WHERE id = ?"
-				if _, err := tx.Exec(query, amount, requestAt, existingItem.ID); err != nil {
-					return err
-				}
+				existingItem.Amount += int(amount)
+				existingItem.UpdatedAt = requestAt
+				updateItems = append(updateItems, existingItem)
 			} else {
 				// 新規アイテムの挿入
 				uitemID, err := h.generateID()
@@ -1146,10 +1165,61 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 					return err
 				}
 
-				query := "INSERT INTO user_items(id, user_id, item_id, item_type, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-				if _, err := tx.Exec(query, uitemID, userID, itemID, master.ItemType, amount, requestAt, requestAt); err != nil {
-					return err
-				}
+				insertItems = append(insertItems, &UserItem{
+					ID:        uitemID,
+					UserID:    userID,
+					ItemID:    itemID,
+					ItemType:  master.ItemType,
+					Amount:    int(amount),
+					CreatedAt: requestAt,
+					UpdatedAt: requestAt,
+				})
+			}
+		}
+
+		// 一括UPDATE（CASE文使用、sqlx.Inで安全に構築）
+		if len(updateItems) > 0 {
+			// IDリストを作成
+			ids := make([]int64, len(updateItems))
+			caseWhenAmount := make([]string, len(updateItems))
+			caseWhenUpdated := make([]string, len(updateItems))
+
+			for i, item := range updateItems {
+				ids[i] = item.ID
+				caseWhenAmount[i] = fmt.Sprintf("WHEN %d THEN %d", item.ID, item.Amount)
+				caseWhenUpdated[i] = fmt.Sprintf("WHEN %d THEN %d", item.ID, item.UpdatedAt)
+			}
+
+			// sqlx.Inを使って安全にIN句を構築
+			baseQuery := fmt.Sprintf(`UPDATE user_items SET
+				amount = CASE id %s END,
+				updated_at = CASE id %s END
+				WHERE id IN (?)`,
+				strings.Join(caseWhenAmount, " "),
+				strings.Join(caseWhenUpdated, " "))
+
+			// updateArgsとidsを結合（型変換が必要）
+			idsInterface := make([]interface{}, len(ids))
+			for i, id := range ids {
+				idsInterface[i] = id
+			}
+			query, params, err := sqlx.In(baseQuery, idsInterface)
+			if err != nil {
+				return err
+			}
+
+			if _, err := tx.Exec(query, params...); err != nil {
+				return err
+			}
+		}
+
+		// NamedExecを使った一括INSERT
+		if len(insertItems) > 0 {
+			query := `INSERT INTO user_items(id, user_id, item_id, item_type, amount, created_at, updated_at)
+					  VALUES (:id, :user_id, :item_id, :item_type, :amount, :created_at, :updated_at)`
+
+			if _, err := tx.NamedExec(query, insertItems); err != nil {
+				return err
 			}
 		}
 	}
