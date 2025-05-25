@@ -990,7 +990,7 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			}
 		}
 
-		// カードを一括挿入（NamedExec使用）
+		// カードを一括挿入（真のバルク処理）
 		cardInserts := make([]*UserCard, 0)
 		for _, item := range cardItems {
 			master, exists := masterMap[item.ItemID]
@@ -1017,15 +1017,21 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			}
 		}
 
-		// NamedExecを使った一括INSERT
+		// 複数VALUES句を使った真の一括INSERT
 		if len(cardInserts) > 0 {
-			query := `INSERT INTO user_cards(id, user_id, card_id, amount_per_sec, level, total_exp, created_at, updated_at)
-					  VALUES (:id, :user_id, :card_id, :amount_per_sec, :level, :total_exp, :created_at, :updated_at)`
+			valueStrings := make([]string, len(cardInserts))
+			valueArgs := make([]interface{}, 0, len(cardInserts)*8)
 
-			for _, card := range cardInserts {
-				if _, err := tx.NamedExec(query, card); err != nil {
-					return err
-				}
+			for i, card := range cardInserts {
+				valueStrings[i] = "(?, ?, ?, ?, ?, ?, ?, ?)"
+				valueArgs = append(valueArgs, card.ID, card.UserID, card.CardID, card.AmountPerSec, card.Level, card.TotalExp, card.CreatedAt, card.UpdatedAt)
+			}
+
+			query := fmt.Sprintf("INSERT INTO user_cards(id, user_id, card_id, amount_per_sec, level, total_exp, created_at, updated_at) VALUES %s",
+				strings.Join(valueStrings, ","))
+
+			if _, err := tx.Exec(query, valueArgs...); err != nil {
+				return err
 			}
 		}
 	}
@@ -1106,24 +1112,50 @@ func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID 
 			}
 		}
 
-		// 一括UPDATE（NamedExec使用）
+		// 一括UPDATE（真のバルク処理）
 		if len(updateItems) > 0 {
-			query := "UPDATE user_items SET amount = :amount, updated_at = :updated_at WHERE id = :id"
-			for _, item := range updateItems {
-				if _, err := tx.NamedExec(query, item); err != nil {
-					return err
-				}
+			// CASE文を使った一括UPDATE
+			caseWhenAmount := make([]string, len(updateItems))
+			caseWhenUpdated := make([]string, len(updateItems))
+			updateArgs := make([]interface{}, 0, len(updateItems)*4)
+			updateIDs := make([]interface{}, 0, len(updateItems))
+
+			for i, item := range updateItems {
+				caseWhenAmount[i] = "WHEN ? THEN ?"
+				caseWhenUpdated[i] = "WHEN ? THEN ?"
+				updateArgs = append(updateArgs, item.ID, item.Amount, item.ID, item.UpdatedAt)
+				updateIDs = append(updateIDs, item.ID)
+			}
+
+			query := fmt.Sprintf(`UPDATE user_items SET
+				amount = CASE id %s END,
+				updated_at = CASE id %s END
+				WHERE id IN (%s)`,
+				strings.Join(caseWhenAmount, " "),
+				strings.Join(caseWhenUpdated, " "),
+				strings.Repeat("?,", len(updateItems))[:len(updateItems)*2-1])
+
+			allArgs := append(updateArgs, updateIDs...)
+			if _, err := tx.Exec(query, allArgs...); err != nil {
+				return err
 			}
 		}
 
-		// 一括INSERT（NamedExec使用）
+		// 一括INSERT（複数VALUES句使用）
 		if len(insertItems) > 0 {
-			query := `INSERT INTO user_items(id, user_id, item_id, item_type, amount, created_at, updated_at)
-					  VALUES (:id, :user_id, :item_id, :item_type, :amount, :created_at, :updated_at)`
-			for _, item := range insertItems {
-				if _, err := tx.NamedExec(query, item); err != nil {
-					return err
-				}
+			valueStrings := make([]string, len(insertItems))
+			valueArgs := make([]interface{}, 0, len(insertItems)*7)
+
+			for i, item := range insertItems {
+				valueStrings[i] = "(?, ?, ?, ?, ?, ?, ?)"
+				valueArgs = append(valueArgs, item.ID, item.UserID, item.ItemID, item.ItemType, item.Amount, item.CreatedAt, item.UpdatedAt)
+			}
+
+			query := fmt.Sprintf("INSERT INTO user_items(id, user_id, item_id, item_type, amount, created_at, updated_at) VALUES %s",
+				strings.Join(valueStrings, ","))
+
+			if _, err := tx.Exec(query, valueArgs...); err != nil {
+				return err
 			}
 		}
 	}
