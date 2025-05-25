@@ -1,7 +1,7 @@
 APPNAME := isuconquest.go.service
 
 .PHONY: *
-gogo: stop-services build logs/clear start-services
+gogo: stop-services build logs/clear start-services bench
 
 stop-services:
 	sudo systemctl stop nginx
@@ -35,6 +35,9 @@ start-services:
 	sudo systemctl start mysql
 	sudo systemctl start $(APPNAME)
 	sudo systemctl start nginx
+
+bench:
+	ssh isucon-bench "./bin/benchmarker -target-host 172.31.34.129 --request-timeout=30s"
 
 kataribe: timestamp=$(shell TZ=Asia/Tokyo date "+%Y%m%d-%H%M%S")
 kataribe:
