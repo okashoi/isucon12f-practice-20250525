@@ -30,7 +30,7 @@ DIR=`mysql -u"$ISUCON_DB_USER" -p"$ISUCON_DB_PASSWORD" -h "$ISUCON_DB_HOST" -Ns 
 SECURE_DIR=${DIR:-/var/lib/mysql-files/}
 
 # sudo cp 5_user_presents_not_receive_data.tsv ${SECURE_DIR}
-ssh isucon-s3 "sudo cp /home/isucon/webapp/sql/5_user_presents_not_receive_data.tsv ${SECURE_DIR}"
+sudo cp /home/isucon/webapp/sql/5_user_presents_not_receive_data.tsv ${SECURE_DIR}
 echo "LOAD DATA INFILE '${SECURE_DIR}5_user_presents_not_receive_data.tsv' REPLACE INTO TABLE user_presents FIELDS ESCAPED BY '|' IGNORE 1 LINES ;" | mysql -u"$ISUCON_DB_USER" \
         -p"$ISUCON_DB_PASSWORD" \
         --host "$ISUCON_DB_HOST" \
