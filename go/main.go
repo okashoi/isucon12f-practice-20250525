@@ -607,6 +607,151 @@ func (h *Handler) obtainItem(tx *sqlx.Tx, userID, itemID int64, itemType int, ob
 	return obtainCoins, obtainCards, obtainItems, nil
 }
 
+// obtainItemsBatch アイテム付与処理のバッチ版
+func (h *Handler) obtainItemsBatch(tx *sqlx.Tx, presents []*UserPresent, userID int64, requestAt int64) error {
+	// アイテム種別ごとにグループ化
+	coinTotal := int64(0)
+	cardItems := make([]*UserPresent, 0)
+	materialItems := make(map[int64]int64) // item_id -> total_amount
+
+	for _, present := range presents {
+		switch present.ItemType {
+		case 1: // coin
+			coinTotal += int64(present.Amount)
+		case 2: // card(ハンマー)
+			cardItems = append(cardItems, present)
+		case 3, 4: // 強化素材
+			materialItems[present.ItemID] += int64(present.Amount)
+		}
+	}
+
+	// コインの一括更新
+	if coinTotal > 0 {
+		query := "UPDATE users SET isu_coin = isu_coin + ? WHERE id = ?"
+		if _, err := tx.Exec(query, coinTotal, userID); err != nil {
+			return err
+		}
+	}
+
+	// カードの一括挿入
+	if len(cardItems) > 0 {
+		// カードマスター情報を一括取得
+		cardIDs := make([]int64, len(cardItems))
+		for i, item := range cardItems {
+			cardIDs[i] = item.ItemID
+		}
+
+		query := "SELECT * FROM item_masters WHERE id IN (?) AND item_type = 2"
+		query, params, err := sqlx.In(query, cardIDs)
+		if err != nil {
+			return err
+		}
+
+		itemMasters := make([]*ItemMaster, 0)
+		if err := tx.Select(&itemMasters, query, params...); err != nil {
+			return err
+		}
+
+		// マスター情報をマップ化
+		masterMap := make(map[int64]*ItemMaster)
+		for _, master := range itemMasters {
+			masterMap[master.ID] = master
+		}
+
+		// カードを一括挿入
+		for _, item := range cardItems {
+			master, exists := masterMap[item.ItemID]
+			if !exists {
+				return ErrItemNotFound
+			}
+
+			for i := 0; i < item.Amount; i++ {
+				cID, err := h.generateID()
+				if err != nil {
+					return err
+				}
+
+				query := "INSERT INTO user_cards(id, user_id, card_id, amount_per_sec, level, total_exp, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+				if _, err := tx.Exec(query, cID, userID, master.ID, *master.AmountPerSec, 1, 0, requestAt, requestAt); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// 強化素材の一括更新
+	if len(materialItems) > 0 {
+		// 既存のアイテムを取得
+		itemIDs := make([]int64, 0, len(materialItems))
+		for itemID := range materialItems {
+			itemIDs = append(itemIDs, itemID)
+		}
+
+		query := "SELECT * FROM user_items WHERE user_id = ? AND item_id IN (?)"
+		query, params, err := sqlx.In(query, userID, itemIDs)
+		if err != nil {
+			return err
+		}
+
+		existingItems := make([]*UserItem, 0)
+		if err := tx.Select(&existingItems, query, params...); err != nil {
+			return err
+		}
+
+		// 既存アイテムをマップ化
+		existingMap := make(map[int64]*UserItem)
+		for _, item := range existingItems {
+			existingMap[item.ItemID] = item
+		}
+
+		// アイテムマスター情報を取得
+		query = "SELECT * FROM item_masters WHERE id IN (?) AND item_type IN (3, 4)"
+		query, params, err = sqlx.In(query, itemIDs)
+		if err != nil {
+			return err
+		}
+
+		itemMasters := make([]*ItemMaster, 0)
+		if err := tx.Select(&itemMasters, query, params...); err != nil {
+			return err
+		}
+
+		masterMap := make(map[int64]*ItemMaster)
+		for _, master := range itemMasters {
+			masterMap[master.ID] = master
+		}
+
+		// 更新・挿入処理
+		for itemID, amount := range materialItems {
+			master, exists := masterMap[itemID]
+			if !exists {
+				return ErrItemNotFound
+			}
+
+			if existingItem, exists := existingMap[itemID]; exists {
+				// 既存アイテムの更新
+				query := "UPDATE user_items SET amount = amount + ?, updated_at = ? WHERE id = ?"
+				if _, err := tx.Exec(query, amount, requestAt, existingItem.ID); err != nil {
+					return err
+				}
+			} else {
+				// 新規アイテムの挿入
+				uitemID, err := h.generateID()
+				if err != nil {
+					return err
+				}
+
+				query := "INSERT INTO user_items(id, user_id, item_id, item_type, amount, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+				if _, err := tx.Exec(query, uitemID, userID, itemID, master.ItemType, amount, requestAt, requestAt); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 // initialize 初期化処理
 // POST /initialize
 func initialize(c echo.Context) error {
@@ -1277,31 +1422,38 @@ func (h *Handler) receivePresent(c echo.Context) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// 配布処理
+	// プレゼントの削除処理をバッチ化
+	presentIDs := make([]int64, len(obtainPresent))
 	for i := range obtainPresent {
 		if obtainPresent[i].DeletedAt != nil {
 			return errorResponse(c, http.StatusInternalServerError, fmt.Errorf("received present"))
 		}
-
 		obtainPresent[i].UpdatedAt = requestAt
 		obtainPresent[i].DeletedAt = &requestAt
-		v := obtainPresent[i]
-		query = "UPDATE user_presents SET deleted_at=?, updated_at=? WHERE id=?"
-		_, err := tx.Exec(query, requestAt, requestAt, v.ID)
-		if err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
-		}
+		presentIDs[i] = obtainPresent[i].ID
+	}
 
-		_, _, _, err = h.obtainItem(tx, v.UserID, v.ItemID, v.ItemType, int64(v.Amount), requestAt)
-		if err != nil {
-			if err == ErrUserNotFound || err == ErrItemNotFound {
-				return errorResponse(c, http.StatusNotFound, err)
-			}
-			if err == ErrInvalidItemType {
-				return errorResponse(c, http.StatusBadRequest, err)
-			}
-			return errorResponse(c, http.StatusInternalServerError, err)
+	// プレゼントを一括で削除済みにマーク
+	query = "UPDATE user_presents SET deleted_at=?, updated_at=? WHERE id IN (?)"
+	query, params, err = sqlx.In(query, requestAt, requestAt, presentIDs)
+	if err != nil {
+		return errorResponse(c, http.StatusInternalServerError, err)
+	}
+	_, err = tx.Exec(query, params...)
+	if err != nil {
+		return errorResponse(c, http.StatusInternalServerError, err)
+	}
+
+	// アイテム付与処理をバッチ化
+	err = h.obtainItemsBatch(tx, obtainPresent, userID, requestAt)
+	if err != nil {
+		if err == ErrUserNotFound || err == ErrItemNotFound {
+			return errorResponse(c, http.StatusNotFound, err)
 		}
+		if err == ErrInvalidItemType {
+			return errorResponse(c, http.StatusBadRequest, err)
+		}
+		return errorResponse(c, http.StatusInternalServerError, err)
 	}
 
 	err = tx.Commit()
