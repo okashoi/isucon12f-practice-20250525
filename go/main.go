@@ -1378,8 +1378,10 @@ func (h *Handler) drawGacha(c echo.Context) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// プレゼントにガチャ結果を付与する
+	// プレゼントにガチャ結果を付与する（バッチ化）
 	presents := make([]*UserPresent, 0, gachaCount)
+	presentMessage := fmt.Sprintf("%sの付与アイテムです", gachaInfo.Name)
+
 	for _, v := range result {
 		pID, err := h.generateID()
 		if err != nil {
@@ -1392,18 +1394,26 @@ func (h *Handler) drawGacha(c echo.Context) error {
 			ItemType:       v.ItemType,
 			ItemID:         v.ItemID,
 			Amount:         v.Amount,
-			PresentMessage: fmt.Sprintf("%sの付与アイテムです", gachaInfo.Name),
+			PresentMessage: presentMessage,
 			CreatedAt:      requestAt,
 			UpdatedAt:      requestAt,
 		}
-		query = "INSERT INTO user_presents(id, user_id, sent_at, item_type, item_id, amount, present_message, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-		if _, err := tx.Exec(query, present.ID, present.UserID, present.SentAt, present.ItemType, present.ItemID, present.Amount, present.PresentMessage, present.CreatedAt, present.UpdatedAt); err != nil {
-			return errorResponse(c, http.StatusInternalServerError, err)
-		}
-
 		presents = append(presents, present)
 	}
 
+	// プレゼントを一括挿入（NamedExecを使用）
+	if len(presents) > 0 {
+		query = `INSERT INTO user_presents(id, user_id, sent_at, item_type, item_id, amount, present_message, created_at, updated_at)
+				 VALUES (:id, :user_id, :sent_at, :item_type, :item_id, :amount, :present_message, :created_at, :updated_at)`
+
+		for _, present := range presents {
+			if _, err := tx.NamedExec(query, present); err != nil {
+				return errorResponse(c, http.StatusInternalServerError, err)
+			}
+		}
+	}
+
+	// コイン消費
 	query = "UPDATE users SET isu_coin=? WHERE id=?"
 	totalCoin := user.IsuCoin - consumedCoin
 	if _, err := tx.Exec(query, totalCoin, user.ID); err != nil {
