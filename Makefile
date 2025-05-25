@@ -8,8 +8,13 @@ stop-services:
 	sudo systemctl stop $(APPNAME)
 	ssh isucon-s2 "sudo systemctl stop $(APPNAME)"
 	ssh isucon-s3 "sudo systemctl stop $(APPNAME)"
+	ssh isucon-s4 "sudo systemctl stop $(APPNAME)"
+	ssh isucon-s5 "sudo systemctl stop $(APPNAME)"
 	sudo systemctl stop mysql
 	ssh isucon-s2 "sudo systemctl stop mysql"
+	ssh isucon-s3 "sudo systemctl stop mysql"
+	ssh isucon-s4 "sudo systemctl stop mysql"
+	ssh isucon-s5 "sudo systemctl stop mysql"
 
 build:
 	cd go && go build -o isuconquest
@@ -34,15 +39,22 @@ logs/clear:
 	ssh isucon-s2 "sudo truncate --size 0 /var/log/mysql/error.log"
 	ssh isucon-s3 "sudo truncate --size 0 /var/log/mysql/mysql-slow.log && sudo chmod 666 /var/log/mysql/mysql-slow.log"
 	ssh isucon-s3 "sudo truncate --size 0 /var/log/mysql/error.log"
+	ssh isucon-s4 "sudo truncate --size 0 /var/log/mysql/mysql-slow.log && sudo chmod 666 /var/log/mysql/mysql-slow.log"
+	ssh isucon-s4 "sudo truncate --size 0 /var/log/mysql/error.log"
+	ssh isucon-s5 "sudo truncate --size 0 /var/log/mysql/mysql-slow.log && sudo chmod 666 /var/log/mysql/mysql-slow.log"
+	ssh isucon-s5 "sudo truncate --size 0 /var/log/mysql/error.log"
 
 start-services:
 	sudo systemctl daemon-reload
 	ssh isucon-s2 "sudo systemctl start mysql"
 	ssh isucon-s3 "sudo systemctl start mysql"
-	ssh isucon-s3 "sudo systemctl start mysql"
+	ssh isucon-s4 "sudo systemctl start mysql"
+	ssh isucon-s5 "sudo systemctl start mysql"
 	sudo systemctl start $(APPNAME)
 	ssh isucon-s2 "sudo systemctl start $(APPNAME)"
 	ssh isucon-s3 "sudo systemctl start $(APPNAME)"
+	ssh isucon-s4 "sudo systemctl start $(APPNAME)"
+	ssh isucon-s5 "sudo systemctl start $(APPNAME)"
 	sudo systemctl start nginx
 
 bench:
